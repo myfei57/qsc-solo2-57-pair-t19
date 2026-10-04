@@ -12,6 +12,7 @@ from heatnet.source.adjust import apply_adjustment
 from heatnet.source.source import HeatSource
 from heatnet.source.weather import WeatherPush, push_weather
 from heatnet.temp.curve import HeatCurve
+from heatnet.temp.degrade import CurveGovernor
 
 
 def _source() -> HeatSource:
@@ -20,6 +21,10 @@ def _source() -> HeatSource:
 
 def _curve() -> HeatCurve:
     return HeatCurve(default_config().curve)
+
+
+def _governor(curve: HeatCurve) -> CurveGovernor:
+    return CurveGovernor(curve, default_config().degrade)
 
 
 def test_adjust_writes_temperature_and_flow_together():
@@ -90,18 +95,20 @@ def test_quality_must_be_confirmed_before_quantity():
 def test_weather_push_updates_curve_and_fires_source():
     source = _source()
     curve = _curve()
-    report = push_weather(source, curve, WeatherPush(-12.0, 1000.0), 1000.0)
+    report = push_weather(source, curve, _governor(curve), WeatherPush(-12.0, 1000.0), 1000.0)
     assert report["ok"] is True
     assert report["epoch"] == 1
+    assert report["tier"] == "normal"
     assert curve.outdoor_c() == pytest.approx(-12.0)
     assert source.target_c() == pytest.approx(curve.supply_c())
-    assert [step["action"] for step in report["steps"]] == ["apply_forecast", "fire_forecast"]
+    assert [step["action"] for step in report["steps"]] == ["apply_forecast", "tier", "fire_forecast"]
 
 
 def test_out_of_range_forecast_is_rejected_without_touching_curve():
     source = _source()
     curve = _curve()
-    push_weather(source, curve, WeatherPush(-8.0, 1000.0), 1000.0)
+    governor = _governor(curve)
+    push_weather(source, curve, governor, WeatherPush(-8.0, 1000.0), 1000.0)
     before_epoch = curve.epoch()
     before_supply = curve.supply_c()
 
@@ -109,8 +116,9 @@ def test_out_of_range_forecast_is_rejected_without_touching_curve():
         curve.validate(60.0)
     assert curve.rejected() == 1
 
-    report = push_weather(source, curve, WeatherPush(60.0, 1100.0), 1100.0)
+    report = push_weather(source, curve, governor, WeatherPush(60.0, 1100.0), 1100.0)
     assert report["ok"] is False
+    assert report["tier"] == "normal"
     assert curve.epoch() == before_epoch
     assert curve.supply_c() == pytest.approx(before_supply)
     assert "超出曲线适用区间" in report["violations"][0]

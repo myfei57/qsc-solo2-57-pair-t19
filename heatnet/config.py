@@ -1,10 +1,11 @@
 """平台配置。
 
 配置来自 JSON 文件（标准库解析），覆盖热源供温带与调质确认时间、供热曲线的
-室外温度区间与过期时间、换热站混水阀行程与批量确认时间、一次网流量基线与
-调度速率、二次网补水定压带、阀门行程公差、循环泵升速斜率、定压基线范围与
-热量表回绕阈值，以及状态存储目录。任何缺失或越界取值都在装配阶段抛出
-:class:`ConfigError`，不允许带着半份配置启动控制链。
+室外温度区间与过期时间、曲线过期分档的降档阈值与保守供温、换热站混水阀行程
+与批量确认时间、一次网流量基线与调度速率、二次网补水定压带、阀门行程公差、
+循环泵升速斜率、定压基线范围与热量表回绕阈值，以及状态存储目录。任何缺失
+或越界取值都在装配阶段抛出 :class:`ConfigError`，不允许带着半份配置启动
+控制链。
 """
 
 from __future__ import annotations
@@ -111,6 +112,61 @@ class CurveLimits:
         """室外温度是否落在曲线适用区间内。"""
 
         return self.outdoor_min_c <= float(outdoor_c) <= self.outdoor_max_c
+
+
+def _ramp_windows(section: Mapping[str, Any]) -> tuple[tuple[int, int], ...]:
+    value = section.get("ramp_windows", _MISSING)
+    if value is _MISSING:
+        raise ConfigError("配置缺少字段 'ramp_windows'", component="config")
+    if not isinstance(value, (list, tuple)):
+        raise ConfigError("配置字段 'ramp_windows' 必须是时段列表", component="config")
+    windows: list[tuple[int, int]] = []
+    for item in value:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            raise ConfigError("回滑时段必须是 [起始小时, 结束小时] 二元组", component="config")
+        start, end = item
+        for hour in (start, end):
+            if isinstance(hour, bool) or not isinstance(hour, int) or not 0 <= hour <= 23:
+                raise ConfigError("回滑时段小时必须是 0–23 的整数", component="config")
+        if start == end:
+            raise ConfigError("回滑时段的起止小时不能相同", component="config")
+        windows.append((int(start), int(end)))
+    return tuple(windows)
+
+
+@dataclass(frozen=True)
+class DegradeLimits:
+    """曲线过期分档：降档阈值、保守供温与按时段选择的降档方式。
+
+    分档按时间（曲线龄期）：龄期超过 ``stale_after_s`` 进入简化档，超过
+    ``degrade_after_s`` 进入保守档。降到保守档时，当前 UTC 小时落在
+    ``ramp_windows`` 内就按 ``degrade_rate_c_s`` 滑到保守供温，否则立刻切换。
+    """
+
+    degrade_after_s: float
+    conservative_supply_c: float
+    degrade_rate_c_s: float
+    ramp_windows: tuple[tuple[int, int], ...]
+
+    @classmethod
+    def from_mapping(cls, section: Mapping[str, Any]) -> "DegradeLimits":
+        return cls(
+            degrade_after_s=_number(section, "degrade_after_s", minimum=1.0),
+            conservative_supply_c=_number(section, "conservative_supply_c", minimum=1.0),
+            degrade_rate_c_s=_number(section, "degrade_rate_c_s", minimum=0.01),
+            ramp_windows=_ramp_windows(section),
+        )
+
+    def in_ramp_window(self, hour: int) -> bool:
+        """给定的 UTC 小时是否落在任一回滑时段内（支持跨午夜时段）。"""
+
+        for start, end in self.ramp_windows:
+            if start < end:
+                if start <= hour < end:
+                    return True
+            elif hour >= start or hour < end:
+                return True
+        return False
 
 
 @dataclass(frozen=True)
@@ -284,6 +340,7 @@ class PlatformConfig:
     storage_root: str
     source: SourceLimits
     curve: CurveLimits
+    degrade: DegradeLimits
     station: StationLimits
     primary: PrimaryLimits
     secondary: SecondaryLimits
@@ -303,11 +360,18 @@ class PlatformConfig:
             raise ConfigError("platform.storage_root 必须是非空字符串", component="config")
 
         limits = _section(mapping, "limits")
+        curve = CurveLimits.from_mapping(_section(limits, "curve"))
+        degrade = DegradeLimits.from_mapping(_section(limits, "degrade"))
+        if degrade.degrade_after_s <= curve.stale_after_s:
+            raise ConfigError("降档阈值 degrade_after_s 必须大于曲线新鲜度窗口 stale_after_s", component="config")
+        if not curve.supply_low_c <= degrade.conservative_supply_c <= curve.supply_high_c:
+            raise ConfigError("保守供温必须落在曲线供温区间内", component="config")
         return cls(
             name=name,
             storage_root=storage_root,
             source=SourceLimits.from_mapping(_section(limits, "source")),
-            curve=CurveLimits.from_mapping(_section(limits, "curve")),
+            curve=curve,
+            degrade=degrade,
             station=StationLimits.from_mapping(_section(limits, "station")),
             primary=PrimaryLimits.from_mapping(_section(limits, "primary")),
             secondary=SecondaryLimits.from_mapping(_section(limits, "secondary")),
@@ -338,6 +402,7 @@ def default_config() -> PlatformConfig:
         storage_root="var/state",
         source=SourceLimits(92.0, 115.0, 35.0, 900.0, 4200.0, 12.0, 0.35),
         curve=CurveLimits(-26.0, 18.0, 55.0, 95.0, 1800.0),
+        degrade=DegradeLimits(5400.0, 68.0, 0.05, ((22, 6),)),
         station=StationLimits(60.0, 2.5, 9.0, 8.0),
         primary=PrimaryLimits(2400.0, 180.0, 4.0),
         secondary=SecondaryLimits(320.0, 260.0, 420.0, 10.0, 45.0),
@@ -369,6 +434,12 @@ def config_to_mapping(cfg: PlatformConfig) -> dict:
                 "supply_low_c": cfg.curve.supply_low_c,
                 "supply_high_c": cfg.curve.supply_high_c,
                 "stale_after_s": cfg.curve.stale_after_s,
+            },
+            "degrade": {
+                "degrade_after_s": cfg.degrade.degrade_after_s,
+                "conservative_supply_c": cfg.degrade.conservative_supply_c,
+                "degrade_rate_c_s": cfg.degrade.degrade_rate_c_s,
+                "ramp_windows": [[start, end] for start, end in cfg.degrade.ramp_windows],
             },
             "station": {
                 "setpoint_c": cfg.station.setpoint_c,

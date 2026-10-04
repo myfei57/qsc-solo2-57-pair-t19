@@ -17,6 +17,7 @@ from ..source.source import HeatSource
 from ..source.weather import WeatherPush, push_weather
 from ..store.state import DurableState
 from ..temp.curve import HeatCurve
+from ..temp.degrade import CurveGovernor
 from ..valve.valve import Valve
 
 MAX_STEPS = 1200
@@ -25,6 +26,7 @@ MAX_STEPS = 1200
 def startup_plant(
     source: HeatSource,
     curve: HeatCurve,
+    governor: CurveGovernor,
     network: PrimaryNetwork,
     loop: SecondaryLoop,
     pump: Pump,
@@ -40,14 +42,14 @@ def startup_plant(
     steps: list[dict] = []
     violations: list[str] = []
 
-    weather = push_weather(source, curve, WeatherPush(outdoor_c, now), now)
+    weather = push_weather(source, curve, governor, WeatherPush(outdoor_c, now), now)
     steps.extend(weather["steps"])
     violations.extend(weather["violations"])
     if not weather["ok"]:
         return {"ok": False, "steps": steps, "violations": violations, "stage": "weather"}
 
     for _ in range(MAX_STEPS):
-        source.settle_quality(curve.supply_c(), dt)
+        source.settle_quality(governor.target_c(), dt)
         if source.quality_confirmed():
             break
     steps.append(
@@ -99,6 +101,8 @@ def startup_plant(
         "steps": steps,
         "violations": violations,
         "stage": "done",
+        "tier": governor.tier(),
+        "transitions": weather.get("transitions", []),
         "flow_t_h": round(source.flow_t_h(), 2),
         "supply_c": round(source.temperature_c(), 2),
         "return_c": round(loop.return_c(), 2),

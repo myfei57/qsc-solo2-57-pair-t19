@@ -1,8 +1,10 @@
 """控制周期编排。
 
-一个控制步里：先看曲线是否还在新鲜度窗口内，再把热源温度往曲线供温逼近，随后
-一次网跟随热源，二次网按当前流量推进回水。任何一环越界都记进违约项返回，由平台
-决定是否停机。
+一个控制步里：先由档位管理器按曲线龄期评估当前档位（正常／简化／保守），
+再把热源温度往该档位对应的目标供温逼近，随后一次网跟随热源，二次网按当前
+流量推进回水。曲线过期不再让整链停摆：刚过期按简化档定点运行，过期太久
+按保守档运行，迁移逐跳落审计。任何一环越界都记进违约项返回，由平台决定
+是否停机。
 """
 
 from __future__ import annotations
@@ -10,14 +12,14 @@ from __future__ import annotations
 from ..primary.network import PrimaryNetwork
 from ..secondary.loop import SecondaryLoop
 from ..source.source import HeatSource
-from ..temp.curve import HeatCurve
+from ..temp.degrade import CurveGovernor
 
 MAX_STEPS = 600
 
 
 def advance_heating(
     source: HeatSource,
-    curve: HeatCurve,
+    governor: CurveGovernor,
     network: PrimaryNetwork,
     loop: SecondaryLoop,
     flow_t_h: float,
@@ -31,14 +33,22 @@ def advance_heating(
     steps: list[dict] = []
     violations: list[str] = []
 
-    if curve.is_stale(now):
-        violations.append("curve_stale")
-        steps.append(
-            {"component": "temp", "action": "stale", "detail": {"updated_at": round(curve.updated_at(), 3)}}
-        )
-        return {"ok": False, "steps": steps, "violations": violations, "stage": "curve"}
+    decision = governor.evaluate(now, dt)
+    steps.append(
+        {
+            "component": "temp",
+            "action": "tier",
+            "detail": {
+                "tier": decision["tier"],
+                "target_c": decision["target_c"],
+                "mode": decision["mode"],
+                "age_s": decision["age_s"],
+                "partial_failure": decision["partial_failure"],
+            },
+        }
+    )
 
-    target = curve.supply_c()
+    target = governor.target_c()
     source.settle_quality(target, dt)
     steps.append(
         {
@@ -87,6 +97,8 @@ def advance_heating(
         "steps": steps,
         "violations": violations,
         "stage": "done",
+        "tier": decision["tier"],
+        "transitions": decision["transitions"],
         "temperature_c": round(source.temperature_c(), 2),
         "return_c": round(loop.return_c(), 2),
     }

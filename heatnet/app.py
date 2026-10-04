@@ -47,6 +47,7 @@ from .store.journal import JsonlJournal
 from .store.metrics import StoreMetrics
 from .store.state import DurableState
 from .temp.curve import HeatCurve
+from .temp.degrade import CurveGovernor
 from .temp.forecast import build_forecast, describe_forecast
 from .telemetry import TrendBuffer
 from .valve.move import load_valve
@@ -96,6 +97,7 @@ class Platform:
 
         self.zones = ZoneRegistry()
         self.curve = HeatCurve(self.config.curve)
+        self.governor = CurveGovernor(self.curve, self.config.degrade)
         self.source = HeatSource(self.config.source)
         self.network = PrimaryNetwork(self.config.primary)
         self.secondary = SecondaryLoop(self.config.secondary)
@@ -268,6 +270,25 @@ class Platform:
         )
         return summary
 
+    def _publish_tier_transitions(self, transitions: list[dict]) -> None:
+        """把档位迁移逐跳写审计：降档记 warning，恢复记 notice。"""
+
+        for item in transitions:
+            downgrade = item.get("direction") == "downgrade"
+            self.bus.publish(
+                Event.of(
+                    "temp",
+                    "temp",
+                    "tier_transition",
+                    severity="warning" if downgrade else "notice",
+                    message=(
+                        f"曲线档位 {item['from_tier']} → {item['to_tier']}"
+                        f"（{item['reason']}）"
+                    ),
+                    **item,
+                )
+            )
+
     # ---- 生命周期 -----------------------------------------------------
 
     def start(self) -> dict:
@@ -299,6 +320,7 @@ class Platform:
             report = startup_plant(
                 self.source,
                 self.curve,
+                self.governor,
                 self.network,
                 self.secondary,
                 self.pump,
@@ -309,6 +331,7 @@ class Platform:
                 demand_pct,
             )
             summary = self._record_operation(op_id, "startup", report)
+            self._publish_tier_transitions(report.get("transitions", []))
             self._operations += 1
             self._persist()
             return {**report, **summary, "station": station}
@@ -341,10 +364,12 @@ class Platform:
             report = push_weather(
                 self.source,
                 self.curve,
+                self.governor,
                 WeatherPush(outdoor_c, self.clock.now(), station),
                 self.clock.now(),
             )
             summary = self._record_operation(op_id, "weather", report)
+            self._publish_tier_transitions(report.get("transitions", []))
             self._operations += 1
             self._persist()
             return {**report, **summary}
@@ -627,8 +652,9 @@ class Platform:
             moment = self.clock.now()
             flow = self.source.flow_t_h() or self.network.flow_t_h()
             report = advance_heating(
-                self.source, self.curve, self.network, self.secondary, flow, moment, dt
+                self.source, self.governor, self.network, self.secondary, flow, moment, dt
             )
+            self._publish_tier_transitions(report.get("transitions", []))
             self.trend.append("supply_c", moment, self.source.temperature_c())
             self.trend.append("return_c", moment, self.secondary.return_c())
             self.trend.append("network_flow_t_h", moment, self.network.flow_t_h())
@@ -722,11 +748,14 @@ class Platform:
         return self.meters.meters()
 
     def curve_report(self) -> dict:
-        """返回供热曲线与新鲜度报告。"""
+        """返回供热曲线、新鲜度与当前档位报告（控制台与审计读同一份）。"""
 
-        snapshot = self.curve.snapshot(self.clock.now())
+        now = self.clock.now()
+        snapshot = self.curve.snapshot(now)
         payload = snapshot.as_dict()
         payload["range"] = [self.config.curve.outdoor_min_c, self.config.curve.outdoor_max_c]
+        payload["tier"] = self.governor.tier()
+        payload["governor"] = self.governor.snapshot(now)
         return payload
 
     def outdoor_forecast(self, outdoor_c: float | None = None, steps: int = 5) -> dict:

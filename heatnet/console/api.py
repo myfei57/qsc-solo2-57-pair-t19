@@ -244,6 +244,8 @@ class Api:
             "source_state": platform.source.state(),
             "supply_c": round(platform.source.temperature_c(), 2),
             "flow_t_h": round(platform.network.flow_t_h(), 2),
+            "curve_tier": platform.governor.tier(),
+            "curve_partial_failure": platform.governor.partial_failure(platform.clock.now()),
             "last_audit_ts": platform.audit.tail(1)[-1]["ts"] if platform.audit.tail(1) else None,
         }
         return {"ready": all(checks.values()), "checks": checks, "info": info}

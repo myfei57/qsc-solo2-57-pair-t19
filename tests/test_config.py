@@ -17,6 +17,10 @@ def test_default_config_is_consistent():
     assert config.curve.outdoor_in_range(40.0) is False
     assert config.source.flow_in_range(2000.0) is True
     assert config.source.overtemperature(config.source.supply_max_c + 1.0) is True
+    assert config.degrade.degrade_after_s > config.curve.stale_after_s
+    assert config.curve.supply_low_c <= config.degrade.conservative_supply_c <= config.curve.supply_high_c
+    assert config.degrade.in_ramp_window(23) is True
+    assert config.degrade.in_ramp_window(12) is False
 
 
 def test_config_reloads_from_mapping():
@@ -49,6 +53,28 @@ def test_broken_flow_range_is_rejected():
     mapping["limits"]["source"]["flow_min_t_h"] = 9000.0
     with pytest.raises(ConfigError):
         type(default_config()).from_mapping(mapping)
+
+
+def test_broken_degrade_threshold_is_rejected():
+    mapping = config_to_mapping(default_config())
+    mapping["limits"]["degrade"]["degrade_after_s"] = mapping["limits"]["curve"]["stale_after_s"]
+    with pytest.raises(ConfigError):
+        type(default_config()).from_mapping(mapping)
+
+
+def test_conservative_supply_outside_curve_range_is_rejected():
+    mapping = config_to_mapping(default_config())
+    mapping["limits"]["degrade"]["conservative_supply_c"] = 10.0
+    with pytest.raises(ConfigError):
+        type(default_config()).from_mapping(mapping)
+
+
+def test_broken_ramp_windows_are_rejected():
+    for broken in ([[6, 6]], [[24, 6]], [[-1, 6]], [[22]], "always"):
+        mapping = config_to_mapping(default_config())
+        mapping["limits"]["degrade"]["ramp_windows"] = broken
+        with pytest.raises(ConfigError):
+            type(default_config()).from_mapping(mapping)
 
 
 def test_primary_and_valve_helpers():
