@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -38,6 +39,13 @@ def _number(section: Mapping[str, Any], key: str, *, minimum: float | None = Non
     if minimum is not None and number < minimum:
         raise ConfigError(f"配置字段 {key!r} 不得小于 {minimum}", component="config")
     return number
+
+
+def _hour(section: Mapping[str, Any], key: str) -> int:
+    number = _number(section, key, minimum=0)
+    if number > 24 or number != int(number):
+        raise ConfigError(f"配置字段 {key!r} 必须是 0 到 24 之间的整数小时", component="config")
+    return int(number)
 
 
 @dataclass(frozen=True)
@@ -84,13 +92,23 @@ class SourceLimits:
 
 @dataclass(frozen=True)
 class CurveLimits:
-    """供热曲线的室外温度区间与新鲜度约束。"""
+    """供热曲线的室外温度区间、新鲜度与降级分档约束。
+
+    分档只按最近一版有效气象的经过时间判定，不按温度偏差判定。
+    ``stale_after_s`` 是正常档的新鲜度门限；超过它进入简化档，超过
+    ``conservative_after_s`` 进入保守档。
+    """
 
     outdoor_min_c: float
     outdoor_max_c: float
     supply_low_c: float
     supply_high_c: float
     stale_after_s: float
+    conservative_after_s: float
+    conservative_offset_c: float
+    fallback_rate_c_s: float
+    conservative_immediate_start_h: int
+    conservative_immediate_end_h: int
 
     @classmethod
     def from_mapping(cls, section: Mapping[str, Any]) -> "CurveLimits":
@@ -100,17 +118,42 @@ class CurveLimits:
             supply_low_c=_number(section, "supply_low_c", minimum=1.0),
             supply_high_c=_number(section, "supply_high_c", minimum=1.0),
             stale_after_s=_number(section, "stale_after_s", minimum=1.0),
+            conservative_after_s=_number(section, "conservative_after_s", minimum=1.0),
+            conservative_offset_c=_number(section, "conservative_offset_c", minimum=0.0),
+            fallback_rate_c_s=_number(section, "fallback_rate_c_s", minimum=0.01),
+            conservative_immediate_start_h=_hour(section, "conservative_immediate_start_h"),
+            conservative_immediate_end_h=_hour(section, "conservative_immediate_end_h"),
         )
         if limits.outdoor_min_c >= limits.outdoor_max_c:
             raise ConfigError("室外温度下限必须小于上限", component="config")
         if limits.supply_low_c >= limits.supply_high_c:
             raise ConfigError("曲线低温供温必须小于高温供温", component="config")
+        if limits.stale_after_s >= limits.conservative_after_s:
+            raise ConfigError("简化档门限必须早于保守档门限", component="config")
+        for hour in (limits.conservative_immediate_start_h, limits.conservative_immediate_end_h):
+            if not 0 <= hour <= 24:
+                raise ConfigError("保守档立即切换时段必须在 0 到 24 时之间", component="config")
         return limits
 
     def outdoor_in_range(self, outdoor_c: float) -> bool:
         """室外温度是否落在曲线适用区间内。"""
 
         return self.outdoor_min_c <= float(outdoor_c) <= self.outdoor_max_c
+
+    def conservative_immediate_now(self, now: float | None = None) -> bool:
+        """当前本地时段降入保守档时是否立即切值。
+
+        起止时间相同表示全天立即切换；其他配置按半开区间处理，支持跨零点。
+        """
+
+        start = self.conservative_immediate_start_h
+        end = self.conservative_immediate_end_h
+        if start == end:
+            return True
+        hour = time.localtime(time.time() if now is None else float(now)).tm_hour
+        if start < end:
+            return start <= hour < end
+        return hour >= start or hour < end
 
 
 @dataclass(frozen=True)
@@ -303,11 +346,16 @@ class PlatformConfig:
             raise ConfigError("platform.storage_root 必须是非空字符串", component="config")
 
         limits = _section(mapping, "limits")
+        source = SourceLimits.from_mapping(_section(limits, "source"))
+        curve = CurveLimits.from_mapping(_section(limits, "curve"))
+        if curve.supply_high_c + curve.conservative_offset_c >= source.supply_max_c:
+            raise ConfigError("保守曲线供温必须低于热源供温上限", component="config")
+
         return cls(
             name=name,
             storage_root=storage_root,
-            source=SourceLimits.from_mapping(_section(limits, "source")),
-            curve=CurveLimits.from_mapping(_section(limits, "curve")),
+            source=source,
+            curve=curve,
             station=StationLimits.from_mapping(_section(limits, "station")),
             primary=PrimaryLimits.from_mapping(_section(limits, "primary")),
             secondary=SecondaryLimits.from_mapping(_section(limits, "secondary")),
@@ -337,7 +385,7 @@ def default_config() -> PlatformConfig:
         name="heatnet",
         storage_root="var/state",
         source=SourceLimits(92.0, 115.0, 35.0, 900.0, 4200.0, 12.0, 0.35),
-        curve=CurveLimits(-26.0, 18.0, 55.0, 95.0, 1800.0),
+        curve=CurveLimits(-26.0, 18.0, 55.0, 95.0, 1800.0, 3600.0, 5.0, 0.25, 6, 22),
         station=StationLimits(60.0, 2.5, 9.0, 8.0),
         primary=PrimaryLimits(2400.0, 180.0, 4.0),
         secondary=SecondaryLimits(320.0, 260.0, 420.0, 10.0, 45.0),
@@ -369,6 +417,11 @@ def config_to_mapping(cfg: PlatformConfig) -> dict:
                 "supply_low_c": cfg.curve.supply_low_c,
                 "supply_high_c": cfg.curve.supply_high_c,
                 "stale_after_s": cfg.curve.stale_after_s,
+                "conservative_after_s": cfg.curve.conservative_after_s,
+                "conservative_offset_c": cfg.curve.conservative_offset_c,
+                "fallback_rate_c_s": cfg.curve.fallback_rate_c_s,
+                "conservative_immediate_start_h": cfg.curve.conservative_immediate_start_h,
+                "conservative_immediate_end_h": cfg.curve.conservative_immediate_end_h,
             },
             "station": {
                 "setpoint_c": cfg.station.setpoint_c,

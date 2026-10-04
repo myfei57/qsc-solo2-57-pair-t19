@@ -18,7 +18,12 @@
       "outdoor_max_c": 18.0,
       "supply_low_c": 55.0,
       "supply_high_c": 95.0,
-      "stale_after_s": 1800.0
+      "stale_after_s": 1800.0,
+      "conservative_after_s": 3600.0,
+      "conservative_offset_c": 5.0,
+      "fallback_rate_c_s": 0.25,
+      "conservative_immediate_start_h": 6,
+      "conservative_immediate_end_h": 22
     },
     "station": {
       "setpoint_c": 60.0,

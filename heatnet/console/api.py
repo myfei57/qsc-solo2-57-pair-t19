@@ -233,8 +233,10 @@ class Api:
 
     def _readiness(self, params: dict, body: dict) -> dict:
         platform = self._platform
+        snapshot = platform.curve.snapshot(platform.clock.now())
         checks = {
-            "curve_fresh": not platform.curve.is_stale(platform.clock.now()),
+            "curve_fresh": not snapshot.stale,
+            "curve_runnable": snapshot.runnable,
             "source_online": platform.source.state() == "online",
             "flow_above_threshold": not platform.network.low_flow(),
             "pressure_in_band": not platform.secondary.needs_makeup()
@@ -244,16 +246,23 @@ class Api:
             "source_state": platform.source.state(),
             "supply_c": round(platform.source.temperature_c(), 2),
             "flow_t_h": round(platform.network.flow_t_h(), 2),
+            "curve_tier": snapshot.tier,
+            "curve_tier_label": snapshot.tier_label,
+            "curve_kind": snapshot.curve,
+            "curve_basis": snapshot.basis,
+            "curve_transition_mode": snapshot.transition_mode,
             "last_audit_ts": platform.audit.tail(1)[-1]["ts"] if platform.audit.tail(1) else None,
         }
-        return {"ready": all(checks.values()), "checks": checks, "info": info}
+        ready_checks = {key: value for key, value in checks.items() if key != "curve_fresh"}
+        return {"ready": all(ready_checks.values()), "checks": checks, "info": info}
 
     # ---- 动作 ---------------------------------------------------------
 
     def _weather(self, params: dict, body: dict) -> dict:
-        return self._platform.push_weather(
-            _as_float(body, "outdoor_c", 0.0), str(body.get("station", "console"))
-        )
+        outdoor = body.get("outdoor_c")
+        outdoor_value = None if outdoor is None else float(outdoor)
+        station = str(body.get("station", "console"))
+        return self._platform.push_weather(outdoor_value, station)
 
     def _adjust(self, params: dict, body: dict) -> dict:
         return self._platform.adjust_source(

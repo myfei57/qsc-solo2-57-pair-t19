@@ -216,6 +216,7 @@ class Platform:
         asset = str(report.get("asset", report.get("station", "")))
         for step in report.get("steps", []):
             detail = dict(step.get("detail", {}))
+            severity = str(detail.pop("severity", "notice"))
             flat = {
                 key: value
                 for key, value in detail.items()
@@ -228,7 +229,7 @@ class Platform:
                     step["action"],
                     asset=asset,
                     op_id=op_id,
-                    severity="notice",
+                    severity=severity,
                     **flat,
                 )
             )
@@ -333,7 +334,7 @@ class Platform:
 
     # ---- 操作编排 -----------------------------------------------------
 
-    def push_weather(self, outdoor_c: float, station: str = "console") -> dict:
+    def push_weather(self, outdoor_c: float | None, station: str = "console") -> dict:
         """接收一次气象推送并让热源按新曲线点火。"""
 
         with self._lock:
@@ -629,6 +630,7 @@ class Platform:
             report = advance_heating(
                 self.source, self.curve, self.network, self.secondary, flow, moment, dt
             )
+            self._record_operation(f"cycle-{self._cycles}", "cycle", report)
             self.trend.append("supply_c", moment, self.source.temperature_c())
             self.trend.append("return_c", moment, self.secondary.return_c())
             self.trend.append("network_flow_t_h", moment, self.network.flow_t_h())
@@ -724,9 +726,17 @@ class Platform:
     def curve_report(self) -> dict:
         """返回供热曲线与新鲜度报告。"""
 
-        snapshot = self.curve.snapshot(self.clock.now())
+        now = self.clock.now()
+        # 查询不补写审计；如果控制循环还没跨过门限，仍按已落审计的档位展示。
+        snapshot = self.curve.snapshot(now)
         payload = snapshot.as_dict()
         payload["range"] = [self.config.curve.outdoor_min_c, self.config.curve.outdoor_max_c]
+        payload["thresholds_s"] = {
+            "stale_after": self.config.curve.stale_after_s,
+            "conservative_after": self.config.curve.conservative_after_s,
+            "fallback_rate_c_s": self.config.curve.fallback_rate_c_s,
+            "conservative_offset_c": self.config.curve.conservative_offset_c,
+        }
         return payload
 
     def outdoor_forecast(self, outdoor_c: float | None = None, steps: int = 5) -> dict:

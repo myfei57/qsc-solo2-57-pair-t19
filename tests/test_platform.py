@@ -9,6 +9,41 @@ from heatnet.config import default_config
 from heatnet.station.service import CancelToken
 
 
+def test_curve_tier_is_visible_and_audited_when_weather_ages(platform):
+    platform.start()
+    platform.push_weather(-10.0)
+    assert platform.curve_report()["tier"] == "normal"
+
+    platform.clock.advance(1801.0)
+    report = platform.cycle(dt=1.0)
+    assert report["tier"] == "simplified"
+    assert report["ok"] is True
+    status = platform.status()
+    assert status["curve"]["tier"] == "simplified"
+    assert status["curve"]["tier_label"] == "简化运行"
+    assert status["curve"]["curve"] == "last_valid"
+    actions = [entry["action"] for entry in platform.audit.entries(limit=20)]
+    assert "tier_change" in actions
+    tier_records = [entry for entry in platform.audit.entries(limit=20) if entry["action"] == "tier_change"]
+    assert tier_records[0]["payload"]["tier"] == "simplified"
+
+
+def test_readiness_stays_runnable_after_curve_leaves_fresh_window(platform):
+    platform.start()
+    platform.push_weather(-8.0)
+    platform.clock.advance(1801.0)
+    platform.cycle(dt=1.0)
+    from heatnet.console.api import Api
+
+    status, payload = Api(platform).handle("GET", "/api/readiness", {}, {})
+    assert status == 200
+    assert payload["checks"]["curve_fresh"] is False
+    assert payload["checks"]["curve_runnable"] is True
+    assert payload["ready"] is True
+    assert payload["info"]["curve_tier"] == "simplified"
+    assert payload["info"]["curve_basis"] == "forecast_age_s"
+
+
 def test_startup_dispatch_and_cycle(online):
     for _ in range(120):
         online.cycle(dt=1.0)

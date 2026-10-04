@@ -1,12 +1,13 @@
 """控制周期编排。
 
-一个控制步里：先看曲线是否还在新鲜度窗口内，再把热源温度往曲线供温逼近，随后
-一次网跟随热源，二次网按当前流量推进回水。任何一环越界都记进违约项返回，由平台
-决定是否停机。
+一个控制步先按最近一版有效气象的年龄同步曲线档位：正常与简化档使用最近有效曲线，
+过期过久才进入保守档。随后实际供温按当前档位的切换方式逼近目标，一次网跟随热源，
+二次网按当前流量推进回水。气象缺报只触发降档，控制链仍保持可运行。
 """
 
 from __future__ import annotations
 
+from ..errors import PlantError
 from ..primary.network import PrimaryNetwork
 from ..secondary.loop import SecondaryLoop
 from ..source.source import HeatSource
@@ -31,15 +32,61 @@ def advance_heating(
     steps: list[dict] = []
     violations: list[str] = []
 
-    if curve.is_stale(now):
-        violations.append("curve_stale")
+    transitions = curve.sync(now)
+    for transition in transitions:
+        detail = transition.as_dict()
+        severity = "warning" if detail["tier"] in ("simplified", "conservative") else "notice"
         steps.append(
-            {"component": "temp", "action": "stale", "detail": {"updated_at": round(curve.updated_at(), 3)}}
+            {
+                "component": "temp",
+                "action": "tier_change",
+                "detail": {"severity": severity, **detail},
+            }
         )
-        return {"ok": False, "steps": steps, "violations": violations, "stage": "curve"}
+        if detail["tier"] == "conservative" and detail["mode"] == "immediate":
+            try:
+                source.fire(curve.supply_c())
+            except PlantError as error:
+                violations.append(error.message)
+                return {"ok": False, "steps": steps, "violations": violations, "stage": "temp"}
+            steps.append(
+                {
+                    "component": "source",
+                    "action": "fire_conservative",
+                    "detail": {"temperature_c": round(source.temperature_c(), 2)},
+                }
+            )
+
+    completed = curve.settle_active(dt, now)
+    if completed is not None:
+        steps.append(
+            {
+                "component": "temp",
+                "action": "tier_change",
+                "detail": {"severity": "notice", **completed.as_dict()},
+            }
+        )
 
     target = curve.supply_c()
     source.settle_quality(target, dt)
+    snapshot = curve.snapshot(now)
+    steps.append(
+        {
+            "component": "temp",
+            "action": "curve_mode",
+            "detail": {
+                "tier": snapshot.tier,
+                "tier_label": snapshot.tier_label,
+                "curve": snapshot.curve,
+                "transition_mode": snapshot.transition_mode,
+                "target_c": round(curve.target_c(), 2),
+                "supply_c": round(target, 2),
+                "age_s": round(snapshot.age_s, 3),
+                "weather_failed": snapshot.weather_failed,
+                "basis": "forecast_age_s",
+            },
+        }
+    )
     steps.append(
         {
             "component": "source",
@@ -87,6 +134,9 @@ def advance_heating(
         "steps": steps,
         "violations": violations,
         "stage": "done",
+        "tier": snapshot.tier,
+        "tier_label": snapshot.tier_label,
+        "curve": snapshot.curve,
         "temperature_c": round(source.temperature_c(), 2),
         "return_c": round(loop.return_c(), 2),
     }

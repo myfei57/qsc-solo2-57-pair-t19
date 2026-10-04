@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import dataclasses
 import threading
 
 import pytest
 
 from heatnet.config import default_config
 from heatnet.errors import ForecastError, InterlockError
+from heatnet.primary.network import PrimaryNetwork
+from heatnet.secondary.loop import SecondaryLoop
+from heatnet.sequence.heating import advance_heating
 from heatnet.source.adjust import apply_adjustment
 from heatnet.source.source import HeatSource
 from heatnet.source.weather import WeatherPush, push_weather
@@ -20,6 +24,117 @@ def _source() -> HeatSource:
 
 def _curve() -> HeatCurve:
     return HeatCurve(default_config().curve)
+
+
+def _immediate_config():
+    config = default_config()
+    return dataclasses.replace(
+        config,
+        curve=dataclasses.replace(
+            config.curve, conservative_immediate_start_h=0, conservative_immediate_end_h=0
+        ),
+    )
+
+
+def _ramped_config():
+    config = default_config()
+    return dataclasses.replace(
+        config,
+        curve=dataclasses.replace(
+            config.curve, conservative_immediate_start_h=6, conservative_immediate_end_h=22
+        ),
+    )
+
+
+def test_stale_curve_keeps_running_then_enters_conservative_tier():
+    config = _immediate_config()
+    source = HeatSource(config.source)
+    curve = HeatCurve(config.curve)
+    network = PrimaryNetwork(config.primary)
+    loop = SecondaryLoop(config.secondary)
+    push_weather(source, curve, WeatherPush(-10.0, 1000.0), 1000.0)
+    first_supply = curve.supply_c()
+
+    report = advance_heating(source, curve, network, loop, 1000.0, 2801.0, 1.0)
+    assert report["ok"] is True
+    assert report["tier"] == "simplified"
+    assert curve.supply_c() == pytest.approx(first_supply)
+    assert curve.is_stale(2801.0) is True
+
+    advance_heating(source, curve, network, loop, 1000.0, 4601.0, 1.0)
+    assert curve.tier() == "conservative"
+    assert curve.curve_kind() == "conservative"
+    assert curve.supply_c() == pytest.approx(first_supply + config.curve.conservative_offset_c)
+    assert source.temperature_c() == pytest.approx(curve.supply_c())
+
+
+def test_ramped_conservative_downgrade_moves_at_configured_rate():
+    config = _ramped_config()
+    source = HeatSource(config.source)
+    curve = HeatCurve(config.curve)
+    network = PrimaryNetwork(config.primary)
+    loop = SecondaryLoop(config.secondary)
+    push_weather(source, curve, WeatherPush(-10.0, 1000.0), 1000.0)
+    start = curve.supply_c()
+
+    advance_heating(source, curve, network, loop, 1000.0, 2801.0, 1.0)
+    report = advance_heating(source, curve, network, loop, 1000.0, 4601.0, 1.0)
+    assert report["tier"] == "conservative"
+    assert report["curve"] == "conservative"
+    assert curve.transition_mode() == "ramp"
+    assert curve.supply_c() == pytest.approx(start + config.curve.fallback_rate_c_s)
+
+
+def test_conservative_recovery_slides_back_to_normal_curve():
+    config = _immediate_config()
+    source = HeatSource(config.source)
+    curve = HeatCurve(config.curve)
+    network = PrimaryNetwork(config.primary)
+    loop = SecondaryLoop(config.secondary)
+    push_weather(source, curve, WeatherPush(-10.0, 1000.0), 1000.0)
+    advance_heating(source, curve, network, loop, 1000.0, 2801.0, 1.0)
+    advance_heating(source, curve, network, loop, 1000.0, 4601.0, 1.0)
+    conservative_supply = curve.supply_c()
+
+    recovered = push_weather(source, curve, WeatherPush(-12.0, 4700.0), 4700.0)
+    assert recovered["ok"] is True
+    assert recovered["tier"] == "recovering"
+    assert recovered["curve"] == "fresh_forecast"
+    assert source.temperature_c() == pytest.approx(conservative_supply)
+    assert curve.target_c() < conservative_supply
+
+    now = 4701.0
+    while curve.tier() == "recovering":
+        report = advance_heating(source, curve, network, loop, 1000.0, now, 1.0)
+        now += 1.0
+    assert report["tier"] == "normal"
+    assert curve.supply_c() == pytest.approx(curve.target_c())
+    assert any(step["action"] == "tier_change" for step in report["steps"])
+
+
+def test_weather_failure_only_allows_downgrade_and_never_upgrade():
+    config = _immediate_config()
+    source = HeatSource(config.source)
+    curve = HeatCurve(config.curve)
+    push_weather(source, curve, WeatherPush(-10.0, 1000.0), 1000.0)
+
+    failed = push_weather(source, curve, WeatherPush(None, 2801.0), 2801.0)
+    assert failed["ok"] is False
+    assert failed["weather_failed"] is True
+    assert failed["tier"] == "simplified"
+    assert failed["outdoor_c"] is None
+    assert curve.weather_failed() is True
+    assert curve.epoch() == 1
+    assert curve.rejected() == 0
+
+    failed_again = push_weather(source, curve, WeatherPush(60.0, 4601.0), 4601.0)
+    assert failed_again["tier"] == "conservative"
+    assert curve.tier() == "conservative"
+
+    recovered = push_weather(source, curve, WeatherPush(-12.0, 4700.0), 4700.0)
+    assert recovered["ok"] is True
+    assert recovered["tier"] == "recovering"
+    assert curve.weather_failed() is False
 
 
 def test_adjust_writes_temperature_and_flow_together():

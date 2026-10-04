@@ -64,6 +64,9 @@ def test_api_weather_adjust_and_readiness(platform):
     status, ready = api.handle("GET", "/api/readiness", {}, {})
     assert status == 200
     assert ready["checks"]["curve_fresh"] is True
+    assert ready["checks"]["curve_runnable"] is True
+    assert ready["info"]["curve_tier"] == "normal"
+    assert ready["info"]["curve_basis"] == "forecast_age_s"
     assert "source_state" in ready["info"]
 
 
@@ -72,6 +75,9 @@ def test_api_forecast_curve_and_reports(platform):
     status, curve = api.handle("GET", "/api/curve", {}, {})
     assert status == 200
     assert len(curve["table"]) == 3
+    assert curve["tier"] == "normal"
+    assert curve["curve"] == "last_valid"
+    assert curve["thresholds_s"]["conservative_after"] > curve["thresholds_s"]["stale_after"]
     status, forecast = api.handle("GET", "/api/forecast", {"outdoor_c": "-10", "steps": "3"}, {})
     assert status == 200
     assert forecast["count"] == 3

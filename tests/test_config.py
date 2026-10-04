@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 
 import pytest
@@ -49,6 +50,25 @@ def test_broken_flow_range_is_rejected():
     mapping["limits"]["source"]["flow_min_t_h"] = 9000.0
     with pytest.raises(ConfigError):
         type(default_config()).from_mapping(mapping)
+
+
+def test_curve_tier_thresholds_are_time_based_and_ordered():
+    mapping = config_to_mapping(default_config())
+    mapping["limits"]["curve"]["conservative_after_s"] = 100.0
+    with pytest.raises(ConfigError):
+        type(default_config()).from_mapping(mapping)
+
+    config = default_config()
+    assert config.curve.stale_after_s < config.curve.conservative_after_s
+    immediate = dataclasses.replace(
+        config,
+        curve=dataclasses.replace(
+            config.curve, conservative_immediate_start_h=0, conservative_immediate_end_h=0
+        ),
+    )
+    assert immediate.curve.conservative_immediate_now(1_000.0) is True
+    assert config.curve.conservative_immediate_now(1_758_000_000.0) is False
+
 
 
 def test_primary_and_valve_helpers():

@@ -46,7 +46,17 @@ def startup_plant(
     if not weather["ok"]:
         return {"ok": False, "steps": steps, "violations": violations, "stage": "weather"}
 
-    for _ in range(MAX_STEPS):
+    for index in range(MAX_STEPS):
+        moment = now + dt * index
+        completed = curve.settle_active(dt, moment)
+        if completed is not None:
+            steps.append(
+                {
+                    "component": "temp",
+                    "action": "tier_change",
+                    "detail": {"severity": "notice", **completed.as_dict()},
+                }
+            )
         source.settle_quality(curve.supply_c(), dt)
         if source.quality_confirmed():
             break

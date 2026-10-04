@@ -70,6 +70,15 @@ class HeatSource:
         with self._guard:
             return self._quality_hold_s
 
+    def reset_quality(self) -> None:
+        """重新开始调质确认计时。"""
+
+        with self._guard:
+            if self._state == TRIPPED:
+                return
+            self._quality_hold_s = 0.0
+            self._state = QUALITY
+
     def adjustments(self) -> int:
         """返回累计调整次数。"""
 
@@ -89,9 +98,11 @@ class HeatSource:
             return self._trips
 
     def set_target(self, temperature_c: float) -> float:
-        """设定调质目标温度（越界即拒绝）。"""
+        """设定调质目标温度（越界即拒绝），实际温度留给控制周期逼近。"""
 
         with self._guard:
+            if self._state == TRIPPED:
+                raise InterlockError(f"热源已停机（{self._trip_reason}），禁止设定目标", component="source")
             value = float(temperature_c)
             if value >= self._limits.supply_max_c:
                 raise InterlockError("调质目标越上限", component="source")
@@ -117,16 +128,19 @@ class HeatSource:
             self._adjustments += 1
             return self._temperature_c, self._flow_t_h
 
-    def settle_quality(self, target_c: float, dt: float) -> float:
+    def settle_quality(self, target_c: float, dt: float, rate_c_s: float | None = None) -> float:
         """向目标温度逼近一个步长，返回逼近后的温度。"""
 
         if dt <= 0:
             raise ValueError("步长必须为正")
+        ramp_rate = self._limits.adjust_rate_c_s if rate_c_s is None else float(rate_c_s)
+        if ramp_rate <= 0:
+            raise ValueError("调质速率必须为正")
         with self._guard:
             if self._state == TRIPPED:
                 raise InterlockError(f"热源已停机（{self._trip_reason}），禁止调质", component="source")
             self._target_c = float(target_c)
-            step = self._limits.adjust_rate_c_s * dt
+            step = ramp_rate * dt
             delta = self._target_c - self._temperature_c
             if abs(delta) <= step:
                 self._temperature_c = self._target_c
